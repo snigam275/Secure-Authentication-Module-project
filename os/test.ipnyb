@@ -1,0 +1,734 @@
+import bcrypt
+import pyotp
+import sqlite3
+import time
+import os
+import shutil
+import psutil
+from plyer import notification  # For desktop notifications
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import re
+from datetime import datetime, timedelta
+import uuid
+import logging
+from typing import Optional, Tuple
+import sqlite3
+import email_validator
+from pathlib import Path
+import secrets
+
+# Configure logging
+logging.basicConfig(
+    filename='auth_audit.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Security constants
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_TIMEOUT_MINUTES = 15
+SESSION_TIMEOUT_MINUTES = 30
+ACCOUNT_LOCK_DURATION = 300  # 5 minutes
+ALLOWED_FILE_EXTENSIONS = {'.txt', '.log', '.db'}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+def sanitize_input(input_str: str) -> str:
+    """Sanitize user input to prevent injection attacks"""
+    return re.sub(r'[^a-zA-Z0-9@._-]', '', input_str)
+
+def validate_email(email: str) -> bool:
+    """Validate email address format"""
+    try:
+        email_validator.validate_email(email)
+        return True
+    except email_validator.EmailNotValidError:
+        return False
+
+def validate_file_path(file_path: str) -> bool:
+    """Validate file path to prevent directory traversal"""
+    try:
+        path = Path(file_path).resolve()
+        return path.is_file() and path.suffix in ALLOWED_FILE_EXTENSIONS
+    except Exception:
+        return False
+
+def check_file_size(file_path: str) -> bool:
+    """Check if file size is within limits"""
+    try:
+        return os.path.getsize(file_path) <= MAX_FILE_SIZE
+    except Exception:
+        return False
+
+def generate_secure_session_id() -> str:
+    """Generate a cryptographically secure session ID"""
+    return secrets.token_urlsafe(32)
+
+# Add rate limiting dictionary
+login_attempts = {}
+
+class Session:
+    def __init__(self, username: str, role: str, session_id: str):
+        self.username = username
+        self.role = role
+        self.session_id = session_id
+        self.created_at = datetime.now()
+        self.last_activity = datetime.now()
+        self.is_active = True
+
+    def update_activity(self):
+        self.last_activity = datetime.now()
+
+    def is_expired(self, timeout_minutes: int = 30) -> bool:
+        return (datetime.now() - self.last_activity).total_seconds() > timeout_minutes * 60
+
+# Global session store
+active_sessions: dict[str, Session] = {}
+
+def log_audit_event(event_type: str, username: str, details: str, success: bool):
+    """Log security audit events"""
+    logging.info(f"Event: {event_type} | User: {username} | Details: {details} | Success: {success}")
+
+def create_session(username: str, role: str) -> str:
+    """Create a new session with unique ID"""
+    session_id = str(uuid.uuid4())
+    active_sessions[session_id] = Session(username, role, session_id)
+    log_audit_event("SESSION_CREATE", username, f"Session created with ID: {session_id}", True)
+    return session_id
+
+def validate_session(session_id: str) -> Tuple[bool, Optional[Session]]:
+    """Validate if a session is active and not expired"""
+    if session_id not in active_sessions:
+        return False, None
+    
+    session = active_sessions[session_id]
+    if not session.is_active or session.is_expired():
+        session.is_active = False
+        log_audit_event("SESSION_EXPIRED", session.username, f"Session {session_id} expired", False)
+        return False, None
+    
+    session.update_activity()
+    return True, session
+
+def end_session(session_id: str) -> bool:
+    """End a session and log the event"""
+    if session_id in active_sessions:
+        session = active_sessions[session_id]
+        session.is_active = False
+        log_audit_event("SESSION_END", session.username, f"Session {session_id} ended", True)
+        del active_sessions[session_id]
+        return True
+    return False
+
+def check_password_policy(password: str) -> Tuple[bool, str]:
+    """Enforce password policy"""
+    if len(password) < 12:  # Increased minimum length
+        return False, "Password must be at least 12 characters long"
+    if not re.search(r"[A-Z]", password):
+        return False, "Password must contain at least one uppercase letter"
+    if not re.search(r"[a-z]", password):
+        return False, "Password must contain at least one lowercase letter"
+    if not re.search(r"\d", password):
+        return False, "Password must contain at least one number"
+    if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+        return False, "Password must contain at least one special character"
+    if re.search(r"(.)\1{2,}", password):  # Check for repeated characters
+        return False, "Password cannot contain repeated characters"
+    return True, "Password meets complexity requirements"
+
+def enforce_password_expiry(username: str) -> bool:
+    """Check if password needs to be changed"""
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    try:
+        c.execute('SELECT last_password_change, password_expiry FROM users WHERE username = ?', (username,))
+        result = c.fetchone()
+        if result:
+            last_change, expiry_days = result
+            if expiry_days > 0 and (time.time() - last_change) > (expiry_days * 24 * 60 * 60):
+                return True
+        return False
+    finally:
+        conn.close()
+
+def update_password_change_time(username: str):
+    """Update the last password change timestamp"""
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    try:
+        c.execute('UPDATE users SET last_password_change = ? WHERE username = ?', 
+                  (int(time.time()), username))
+        conn.commit()
+    finally:
+        conn.close()
+
+def check_rate_limit(username):
+    """Implement rate limiting for login attempts"""
+    current_time = datetime.now()
+    if username in login_attempts:
+        attempts = login_attempts[username]
+        # Remove attempts older than 15 minutes
+        attempts = [t for t in attempts if current_time - t < timedelta(minutes=15)]
+        if len(attempts) >= 5:
+            return False, "Too many login attempts. Please try again later."
+        attempts.append(current_time)
+        login_attempts[username] = attempts
+    else:
+        login_attempts[username] = [current_time]
+    return True, "Rate limit check passed"
+
+# Step 1: Create a database for storing user credentials
+def init_db():
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+
+    # Enable foreign keys and WAL mode for better concurrency
+    c.execute('PRAGMA foreign_keys = ON')
+    c.execute('PRAGMA journal_mode = WAL')
+
+    # Create the users table with additional security columns
+    c.execute(''' 
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            otp_secret TEXT NOT NULL,
+            role TEXT DEFAULT 'user',
+            failed_attempts INTEGER DEFAULT 0,
+            lock_time INTEGER DEFAULT 0,
+            last_password_change INTEGER DEFAULT 0,
+            password_expiry INTEGER DEFAULT 0,
+            created_at INTEGER DEFAULT (unixepoch()),
+            last_login INTEGER DEFAULT 0
+        );
+    ''')
+
+    # Create an audit log table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER DEFAULT (unixepoch()),
+            event_type TEXT NOT NULL,
+            username TEXT NOT NULL,
+            details TEXT,
+            ip_address TEXT,
+            success BOOLEAN DEFAULT 0
+        );
+    ''')
+
+    conn.commit()
+    conn.close()
+
+# Step 2: Hash the password before storing
+def hash_password(password):
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed, salt
+
+# Step 3: Check if the entered password matches the stored hash
+def check_password(stored_hash, entered_password, salt):
+    entered_hash = bcrypt.hashpw(entered_password.encode('utf-8'), salt)
+    return entered_hash == stored_hash
+
+# Step 4: Register a new user with OTP secret for MFA
+def register_user(username, password, role="user"):
+    # Check password complexity
+    is_valid, message = check_password_policy(password)
+    if not is_valid:
+        print(f"Registration failed: {message}")
+        return False
+    
+    username = sanitize_input(username)
+    if not username:
+        print("Invalid username format")
+        return False
+    
+    hashed_password, salt = hash_password(password)
+    otp_secret = pyotp.random_base32()
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    try:
+        c.execute('INSERT INTO users (username, hashed_password, salt, otp_secret, role, last_password_change) VALUES (?, ?, ?, ?, ?, ?)',
+                  (username, hashed_password.decode('utf-8'), salt.decode('utf-8'), otp_secret, role, int(time.time())))
+        conn.commit()
+        print("User registered successfully!")
+        return True
+    except sqlite3.IntegrityError:
+        print("Username already exists!")
+        return False
+    finally:
+        conn.close()
+
+# Step 5: Login process (with OTP for 2FA)
+def login_user(username, password):
+    username = sanitize_input(username)
+    
+    # Check rate limiting first
+    can_proceed, message = check_rate_limit(username)
+    if not can_proceed:
+        log_audit_event("LOGIN_ATTEMPT", username, "Rate limit exceeded", False)
+        print(message)
+        return False, None
+
+    # Check password expiry
+    if enforce_password_expiry(username):
+        print("Your password has expired. Please change it.")
+        return False, "EXPIRED_PASSWORD"
+
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    try:
+        c.execute('SELECT * FROM users WHERE username = ?', (username,))
+        user = c.fetchone()
+
+        if user:
+            stored_hash = user[2]
+            salt = user[3]
+            otp_secret = user[4]
+            role = user[5]
+            failed_attempts = user[6]
+            lock_time = user[7]
+
+            # Check if account is locked
+            if failed_attempts >= 3 and (time.time() - lock_time) < ACCOUNT_LOCK_DURATION:
+                log_audit_event("LOGIN_ATTEMPT", username, "Account locked", False)
+                print("Account is temporarily locked due to multiple failed login attempts. Please try again later.")
+                return False, None
+
+            # Check password
+            if check_password(stored_hash.encode('utf-8'), password, salt.encode('utf-8')):
+                # Reset failed attempts and update last login
+                c.execute('UPDATE users SET failed_attempts = 0, lock_time = 0, last_login = ? WHERE username = ?', 
+                         (int(time.time()), username))
+                conn.commit()
+                log_audit_event("LOGIN_ATTEMPT", username, "Password verified", True)
+                print("Password verified, please enter the OTP.")
+
+                # Generate and verify OTP
+                totp = pyotp.TOTP(otp_secret)
+                otp = totp.now()
+
+                notification.notify(
+                    title="Your OTP Code",
+                    message=f"Your OTP code is: {otp}",
+                    timeout=5
+                )
+                print("OTP sent as a notification. Please check your desktop.")
+
+                entered_otp = input("Enter OTP from notification: ")
+
+                if totp.verify(entered_otp):
+                    log_audit_event("LOGIN_SUCCESS", username, "OTP verified", True)
+                    print("OTP verified, login successful!")
+                    return True, role
+                else:
+                    log_audit_event("LOGIN_ATTEMPT", username, "Invalid OTP", False)
+                    print("Invalid or expired OTP!")
+                    return False, None
+            else:
+                # Increment failed attempts and lock account if necessary
+                failed_attempts += 1
+                if failed_attempts >= 3:
+                    lock_time = int(time.time())
+                c.execute('UPDATE users SET failed_attempts = ?, lock_time = ? WHERE username = ?', 
+                          (failed_attempts, lock_time, username))
+                conn.commit()
+                log_audit_event("LOGIN_ATTEMPT", username, f"Invalid password (attempt {failed_attempts})", False)
+                print("Invalid password!")
+                return False, None
+        else:
+            log_audit_event("LOGIN_ATTEMPT", username, "User not found", False)
+            print("Username not found!")
+            return False, None
+    finally:
+        conn.close()
+
+# Step 10: Session Management (Tracking Logged-in Users)
+def start_session(username):
+    session_id = str(time.time())  # Generate session ID based on current time
+    active_sessions[session_id] = username
+    print(f"Session started for {username}. Session ID: {session_id}")
+    return session_id
+
+def end_session(session_id):
+    if session_id in active_sessions:
+        print(f"Session for {active_sessions[session_id]} ended.")
+        del active_sessions[session_id]
+
+# New Functionality: Search Files
+def search_files():
+    search_term = input("Enter the name of the file to search: ")
+    found_files = [file for file in os.listdir('.') if search_term.lower() in file.lower()]
+    
+    if found_files:
+        print(f"Found the following files matching '{search_term}':")
+        for file in found_files:
+            print(file)
+    else:
+        print(f"No files found matching '{search_term}'.")
+
+# New Functionality: Lock Account
+def lock_account():
+    username = input("Enter the username to lock: ")
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE username = ?', (username,))
+    user = c.fetchone()
+
+    if user:
+        c.execute('UPDATE users SET failed_attempts = 3, lock_time = ? WHERE username = ?', 
+                  (int(time.time()), username))
+        conn.commit()
+        print(f"Account for {username} is now locked.")
+    else:
+        print(f"User {username} not found.")
+    conn.close()
+
+# New Functionality: Unlock Account
+def unlock_account():
+    username = input("Enter the username to unlock: ")
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE username = ?', (username,))
+    user = c.fetchone()
+
+    if user:
+        c.execute('UPDATE users SET failed_attempts = 0, lock_time = 0 WHERE username = ?', (username,))
+        conn.commit()
+        print(f"Account for {username} is now unlocked.")
+    else:
+        print(f"User {username} not found.")
+    conn.close()
+
+# Step 11: OS-based functionalities (File Management, Process Management, etc.)
+
+def list_files():
+    print("Listing files in current directory:")
+    for file_name in os.listdir('.'):
+        print(file_name)
+
+def create_file():
+    file_name = input("Enter the name of the file to create: ")
+    file_name = sanitize_input(file_name)
+    
+    if not validate_file_path(file_name):
+        print("Invalid file name or extension. Allowed extensions: .txt, .log, .db")
+        return False
+        
+    try:
+        with open(file_name, 'w') as file:
+            file.write("New file created.\n")
+        print(f"File '{file_name}' created.")
+        return True
+    except Exception as e:
+        print(f"Error creating file: {e}")
+        return False
+
+def delete_file():
+    file_name = input("Enter the name of the file to delete: ")
+    file_name = sanitize_input(file_name)
+    
+    if not validate_file_path(file_name):
+        print("Invalid file name or extension. Allowed extensions: .txt, .log, .db")
+        return False
+        
+    if not check_file_size(file_name):
+        print("File size exceeds maximum allowed size (10MB)")
+        return False
+        
+    try:
+        os.remove(file_name)
+        print(f"File '{file_name}' deleted.")
+        return True
+    except Exception as e:
+        print(f"Error deleting file: {e}")
+        return False
+
+def list_processes():
+    print("Listing running processes:")
+    for proc in psutil.process_iter(['pid', 'name']):
+        print(proc.info)
+
+def view_system_info():
+    print("System Information:")
+    print(f"CPU Usage: {psutil.cpu_percent(interval=1)}%")
+    print(f"Memory Usage: {psutil.virtual_memory().percent}%")
+    print(f"Disk Usage: {psutil.disk_usage('/').percent}%")
+
+# New Functionality: View Active Users
+def view_active_users():
+    print("Active sessions/users:")
+    for session_id, username in active_sessions.items():
+        print(f"Session ID: {session_id}, Username: {username}")
+
+# New Functionality: Send Email Notification
+def send_email_notification():
+    sender_email = input("Enter your email: ")
+    receiver_email = input("Enter receiver email: ")
+    
+    if not validate_email(sender_email) or not validate_email(receiver_email):
+        print("Invalid email address format")
+        return False
+        
+    subject = input("Enter email subject: ")
+    body = input("Enter email body: ")
+    password = input("Enter your app password (or regular password if 2FA is not enabled): ")
+
+    message = MIMEMultipart()
+    message['From'] = sender_email
+    message['To'] = receiver_email
+    message['Subject'] = subject
+    message.attach(MIMEText(body, 'plain'))
+
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(sender_email, password)
+            text = message.as_string()
+            server.sendmail(sender_email, receiver_email, text)
+        print("Email sent successfully!")
+        return True
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+        return False
+
+# New Functionality: Backup User Data
+def backup_user_data():
+    print("Backing up user data...")
+    shutil.copy("user_auth.db", "backup_user_auth.db")
+    print("Backup completed successfully.")
+
+# New Functionality: Monitor Running Services
+def monitor_running_services():
+    print("Monitoring running services...")
+    for service in psutil.win_service_iter():
+        print(f"Service: {service.name()} | Status: {service.status()}")
+
+# Missing Functions Implementation
+def view_logs():
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    c.execute('SELECT username, failed_attempts, lock_time FROM users')
+    logs = c.fetchall()
+    print("\nLogin Attempt Logs:")
+    for log in logs:
+        print(f"User: {log[0]}, Failed Attempts: {log[1]}, Lock Time: {log[2]}")
+    conn.close()
+
+def change_role():
+    username = input("Enter username to change role: ")
+    new_role = input("Enter new role (user/admin): ").lower()
+    if new_role not in ['user', 'admin']:
+        print("Invalid role. Use 'user' or 'admin'.")
+        return
+    
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    c.execute('UPDATE users SET role = ? WHERE username = ?', (new_role, username))
+    conn.commit()
+    if c.rowcount == 0:
+        print("User not found.")
+    else:
+        print(f"Role updated to {new_role} for {username}.")
+    conn.close()
+
+def view_users():
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    c.execute('SELECT username, role FROM users')
+    users = c.fetchall()
+    print("\nUser List:")
+    for user in users:
+        print(f"Username: {user[0]}, Role: {user[1]}")
+    conn.close()
+
+def reset_password():
+    username = input("Enter username to reset password: ")
+    username = sanitize_input(username)
+    new_password = input("Enter new password: ")
+    
+    # Check password policy
+    is_valid, message = check_password_policy(new_password)
+    if not is_valid:
+        print(f"Password reset failed: {message}")
+        return False
+    
+    conn = sqlite3.connect('user_auth.db')
+    c = conn.cursor()
+    try:
+        c.execute('SELECT * FROM users WHERE username = ?', (username,))
+        user = c.fetchone()
+        
+        if user:
+            hashed_password, salt = hash_password(new_password)
+            c.execute('UPDATE users SET hashed_password = ?, salt = ?, last_password_change = ? WHERE username = ?',
+                      (hashed_password.decode('utf-8'), salt.decode('utf-8'), int(time.time()), username))
+            conn.commit()
+            print(f"Password reset for {username}.")
+            return True
+        else:
+            print("User not found.")
+            return False
+    finally:
+        conn.close()
+
+def send_notification():
+    message = input("Enter notification message: ")
+    notification.notify(
+        title="Admin Notification",
+        message=message,
+        timeout=10
+    )
+    print("Notification sent.")
+
+def backup_database():
+    backup_name = f"user_auth_backup_{int(time.time())}.db"
+    shutil.copy("user_auth.db", backup_name)
+    print(f"Database backed up as {backup_name}.")
+
+def shutdown_system():
+    confirm = input("Are you sure you want to shutdown the system? (y/n): ").lower()
+    if confirm == 'y':
+        if os.name == 'nt':
+            os.system("shutdown /s /t 1")
+        else:
+            os.system("shutdown now")
+
+def reboot_system():
+    confirm = input("Are you sure you want to reboot the system? (y/n): ").lower()
+    if confirm == 'y':
+        if os.name == 'nt':
+            os.system("shutdown /r /t 1")
+        else:
+            os.system("reboot")
+
+# Step 12: User Dashboard (After Successful Login)
+def user_dashboard(username, role):
+    session_id = create_session(username, role)
+    
+    while True:
+        # Validate session before each operation
+        is_valid, session = validate_session(session_id)
+        if not is_valid:
+            print("Session expired. Please login again.")
+            return False
+
+        print(f"\nWelcome {username} ({role})!")
+        print("1. View Profile")
+        print("2. View Files (Admin Only)")
+        print("3. Create File (Admin Only)")
+        print("4. Delete File (Admin Only)")
+        print("5. View Running Processes (Admin Only)")
+        print("6. View System Info (Admin Only)")
+        print("7. View Logs (Admin Only)")
+        print("8. Change Role (Admin Only)")
+        print("9. View Users List (Admin Only)")
+        print("10. Reset Password (Admin Only)")
+        print("11. Send Notification (Admin Only)")
+        print("12. Backup Database (Admin Only)")
+        print("13. Shutdown System (Admin Only)")
+        print("14. Reboot System (Admin Only)")
+        print("15. View Active Users")
+        print("16. Send Email Notification")
+        print("17. Backup User Data")
+        print("18. Monitor Running Services")
+        print("19. Logout")
+        print("20. Search Files")
+        print("21. Lock Account (Admin Only)")
+        print("22. Unlock Account (Admin Only)")
+
+        choice = input("Select an option: ")
+
+        # Log each action
+        log_audit_event("USER_ACTION", username, f"Selected option: {choice}", True)
+
+        if choice == '1':
+            print(f"Username: {username}")
+            print(f"Role: {role}")
+        elif choice == '2' and role == 'admin':
+            list_files()
+        elif choice == '3' and role == 'admin':
+            create_file()
+        elif choice == '4' and role == 'admin':
+            delete_file()
+        elif choice == '5' and role == 'admin':
+            list_processes()
+        elif choice == '6' and role == 'admin':
+            view_system_info()
+        elif choice == '7' and role == 'admin':
+            view_logs()
+        elif choice == '8' and role == 'admin':
+            change_role()
+        elif choice == '9' and role == 'admin':
+            view_users()
+        elif choice == '10' and role == 'admin':
+            reset_password()
+        elif choice == '11' and role == 'admin':
+            send_notification()
+        elif choice == '12' and role == 'admin':
+            backup_database()
+        elif choice == '13' and role == 'admin':
+            shutdown_system()
+        elif choice == '14' and role == 'admin':
+            reboot_system()
+        elif choice == '15':
+            view_active_users()
+        elif choice == '16':
+            send_email_notification()
+        elif choice == '17':
+            backup_user_data()
+        elif choice == '18':
+            monitor_running_services()
+        elif choice == '19':
+            print("Logging out...")
+            end_session(session_id)
+            return False
+        elif choice == '20':
+            search_files()
+        elif choice == '21' and role == 'admin':
+            lock_account()
+        elif choice == '22' and role == 'admin':
+            unlock_account()
+        else:
+            print("Invalid choice or permission denied.")
+        return True
+
+# Main function for the authentication system
+def main():
+    init_db()  # Initialize the database
+
+    while True:
+        print("\nWelcome to the User Authentication System!")
+        print("1. Register")
+        print("2. Login")
+        print("3. Exit")
+
+        choice = input("Select an option: ")
+
+        if choice == '1':
+            username = input("Enter username: ")
+            password = input("Enter password: ")
+            role = input("Enter role (user/admin): ")
+            register_user(username, password, role)
+
+        elif choice == '2':
+            username = input("Enter username: ")
+            password = input("Enter password: ")
+            success, role = login_user(username, password)
+            if success:
+                session_id = start_session(username)
+                while user_dashboard(username, role):
+                    pass
+                end_session(session_id)
+            else:
+                print("Access denied!")
+
+        elif choice == '3':
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+if __name__ == "__main__":
+    main()
