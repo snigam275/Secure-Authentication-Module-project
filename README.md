@@ -1,4 +1,4 @@
-# 🔐 Secure Authentication System
+# 🔐 Secure Authentication Module for Operating System
 A robust and secure authentication system designed for university-level projects. This system incorporates multi-factor authentication and modern security practices for user management and file handling.
 "Secure Authentication Module: A robust authentication system with encryption, multi-factor authentication, and secure session management."
 Fixed logging bypass vulnerability by enhancing input validation.(bug fixes)
