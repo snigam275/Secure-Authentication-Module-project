@@ -1,0 +1,14 @@
+streamlit==1.32.0
+bcrypt==4.1.2
+pyotp==2.9.0
+redis==5.0.1
+psutil==5.9.8
+plyer==2.1.0
+email-validator==2.1.0.post1
+python-dotenv==1.0.1
+cryptography==41.0.3
+pytest==7.4.0
+pytest-cov==4.1.0
+black==23.7.0
+flake8==6.1.0
+mypy==1.5.1 
